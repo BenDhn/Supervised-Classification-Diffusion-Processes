@@ -1,0 +1,1566 @@
+---
+title: "Supervised multiclass classification of Diffusion Processes"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{How-to-use-the-package}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+Before begining, a quick remark concerning the use of package reticulate.
+When launching the command py_config(), select 'no' to the question about 
+the initialisation of the Python environement, because it will be a basic 
+default environement and you'll struggle importing packages.
+If you've selected 'Yes', then delete manually the virtual environnement, 
+locating it using the command py_config(), and then restart Rstudio using the 
+command .rs.restartR().
+Your welcome !
+
+## Importation of required implemented functions
+```{r importation-functions, echo=TRUE}
+#rm(list = ls())
+#gc()
+source(file = "./SDEsimulation.R")
+# source(file = "./UsefulFunctions_Homogeneous.R")
+# source(file = "./UsefulFunctions_non_Homogeneous.R")
+source(file = "./MainSDEFunction_non_Homogeneous.R")
+source(file = "./MainSDEFunction_Homogeneous.R")
+setwd(dir = "/Users/benjamindahan/Desktop/MVA/Stage/LIU/Code/R/non_Homogeneous")
+#source(file = "./SDEclassif.R")
+```
+
+
+## Set seed for reproducibility
+```{r set-seed, echo=TRUE}
+set.seed(26) 
+```
+
+
+## Importation of required libraries
+```{r importation-libraries, echo=TRUE}
+library(pracma) # For numerical integration if needed
+library(stats)
+library(nnet) 
+library(reshape2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+```
+
+
+## Knitr setup
+```{r knitr-setup, echo=TRUE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 3, fig.height = 3) # Set figure width for full width
+```
+
+## Introduction of the chosen model to test the classifier
+Here we chose the following model : 
+We fix \(K = 3\) classes in the following. Note that we do not consider larger values of \(K\) since the evaluation of the impact of \(K\) on the procedure is beyond the scope of this paper. To illustrate the accuracy of the presented plug-in classifier, we investigate the model described in Table 1. This toy model uses the following drift and diffusion functions:
+
+\[
+\begin{aligned}
+    b_1^*(x) &= \frac{1}{4} + \frac{3}{4} \cos^2(x) \\
+    b_2^*(x) &= \theta \left(\frac{1}{4} + \frac{3}{4} \cos^2(x)\right) \\
+    b_3^*(x) &= -\theta \left(\frac{1}{4} + \frac{3}{4} \cos^2(x)\right) \\
+    \sigma^*(x) &= 0.1 + \frac{0.9}{\sqrt{1 + x^2}}
+\end{aligned}
+\]
+
+
+## Classification Procedure
+
+### Definition of the parameters
+```{r param-definition, echo=TRUE}
+t0 <- 0
+T <- 1
+x0 <- 0
+n <- 100
+Ni_train_list <- c(100, 100, 100)
+Ni_test_list <- c(100, 100, 100)
+labels <- c(1, 2, 3)
+theta <- c(-4, 1, 4)
+SetK <- 2^(0:4)
+sigma_orstein <- 1/2
+```
+
+### Simulation of SDE for training and testing data sets
+```{r sde-simul, echo=TRUE}
+# simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+#                                          Ni_test_list, labels,
+#                                          b_time, sigma_time, theta, plot = FALSE)
+# simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+#                                          Ni_test_list, labels,
+#                                          b_prime, sigma, theta)
+simulation_result <- simulation_sde_orstein(t0, T, x0, n, Ni_train_list,
+                                         Ni_test_list, labels,
+                                         b_orstein, sigma_orstein, theta,
+                                         plot = TRUE)
+# simulation_result <- simulation_sde_mix(t0, T, x0, n, Ni_train_list,
+#                                          Ni_test_list, labels, b,
+#                                          b_orstein, sigma_orstein, theta)
+Xtrain <- simulation_result$Xtrain
+ytrain <- simulation_result$ytrain
+Xtest <- simulation_result$Xtest
+ytest <- simulation_result$ytest
+```
+
+### View of the estimators of coefficients In the homogeneous setting
+```{r}
+NbClass <- length(labels)
+  Drift_a_hat <- list()  # List of estimated coefficients for the drift per class
+  Kdrift <- integer(NbClass)  # List for selected value of dimension K per class
+  N <- ncol(Xtrain)  # Number of observed trajectories
+  n <- nrow(Xtrain)  # Number of observations per trajectory
+  TimeStep <- 1 / n  # Time stamp
+  L <- log(N)  # Bound corresponding in the paper to ANi.log(Ni)
+  classified_data_list <- list()  # List of iXtrain so that we don't need to compute them again
+  b_spline_basis_drift_list <- list()
+  SetK <- c(64)
+for (i in seq_along(labels)){
+    ############################################################################
+    ############################################################################
+    ########## Computation of the drift spline #################################
+    ############################################################################
+    ############################################################################
+    
+    cat('\n-----Beginning Drift estimation-----\n')
+
+    cat('\n-----Class number', i, '-----\n')
+    iXtrain <- Xtrain[, which(ytrain == labels[i])]
+    classified_data_list[[i]] <- iXtrain
+    N_i <- ncol(iXtrain)
+    SupInt <- log(N_i)
+    InfInt <- -SupInt
+    # iZ <- zfun_bis(iXtrain, TimeStep)
+    iZ <- zfun_authors(iXtrain, TimeStep)
+    cat('\n-----K value selection-----\n')
+    Kdrift[i] <- selectdimdrift_authors(iXtrain, 0.1, SetK,
+                                        M, InfInt, SupInt, TimeStep, L)
+    cat('\n-----Selected value K : ', Kdrift[i], '-----\n')
+    iB <- bfun_authors(iXtrain, InfInt, SupInt, Kdrift[i], M)
+    Drift_a_hat[[i]] <- optimfun(iB, iZ, Kdrift[i], M, L)
+    drift_estim <- matrix(0, nrow = n-2, ncol = N_i)
+    for (j in 1:N_i){
+      drift_estim[, j] <- driftspline_authors(iXtrain[1:(n-2), j], Drift_a_hat[[i]],
+                                         InfInt, SupInt, Kdrift[i], M, L)
+    }
+    ############################################################################
+    ############################################################################
+    ########## Computation of the drift real values ############################
+    ############################################################################
+    ############################################################################
+    calculate_b_values <- function(Xtrain, label, labels) {
+    
+    # Get the number of rows and columns in iXtrain_adapted
+    N <- ncol(Xtrain)
+    n <- nrow(Xtrain)
+  
+    # Initialize a matrix to store the results
+    results <- matrix(0, nrow = n, ncol = N)
+    
+    # Loop over each time and each column of iXtrain_adapted to calculate b_time
+    for (j in 1:N) {
+      for (i in 1:n) {
+        # Calculate b_time for each combination of time and X_t value
+        results[i, j] <- b_orstein(Xtrain[i, j], label, labels)
+      }
+    }
+  
+    return(results)
+  }
+    b_values <- calculate_b_values(iXtrain[1:(n-2), ], labels[i], labels)
+    
+    b_df <- data.frame(
+      X = as.vector(iXtrain[1:(n-2), ]),
+      Value = as.vector(b_values),
+      Type = "Drift",  # Adding a type column to distinguish between b and zfun
+      Group = rep(1:ncol(iXtrain), each = n-2)
+     )
+
+   # Create data frame for zfun values
+   bspline_drift_df <- data.frame(
+    X = as.vector(iXtrain[1:(n-2), ]),
+    Value = as.vector(drift_estim),
+    Type = "Increment",  # Adding a type column to distinguish between b and zfun
+    Group = rep(1:ncol(iXtrain), each = n-2)
+   )
+    
+   # Combine both data frames
+   combined_df <- rbind(bspline_drift_df,b_df)
+    
+  p2 <-ggplot(combined_df, aes(x = X, y = Value, color = Type, group = interaction(Type, Group))) +
+    geom_point(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+    labs(
+      title = "Drift and Increment Values for Each Trajectory in Xtrain",
+      x = "Process X",
+      y = "Value"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+    #theme(legend.position = "right") +
+    #guides(color = guide_legend(title = "Trajectory"))
+  print(p2)
+  
+  # df <- data.frame(
+  # x = as.vector(iXtrain_adapted),
+  # y = as.vector(rep(times[1:(n-1)], N_i)),
+  # z = as.vector(drift_estim)
+  # )
+  # library(rgl)
+  # # Plot using plotly's heatmap
+  # plot3d(x = as.vector(iXtrain_adapted),
+  #        y = as.vector(rep(times[1:(n-1)], N_i)),
+  #        z = as.vector(drift_estim), 
+  #        col = "blue")
+  # points3d(x = as.vector(iXtrain_adapted),
+  #        y = as.vector(rep(times[1:(n-1)], N_i)),
+  #        z = as.vector(b_values), 
+  #        col = "green")
+}
+````
+### View of the estimators of coefficients In the non-homogeneous setting
+```{r}
+  NbClass <- length(labels)
+  Drift_a_hat <- list()  # List of estimated coefficients for the drift per class
+  Kdrift <- integer(NbClass)  # List for selected value of dimension K per class
+  N <- ncol(Xtrain)  # Number of observed trajectories
+  n <- nrow(Xtrain)  # Number of observations per trajectory
+  TimeStep <- 1 / n  # Time stamp
+  L <- log(N)  # Bound corresponding in the paper to ANi.log(Ni)
+  classified_data_list <- list()  # List of iXtrain so that we don't need to compute them again
+  b_spline_basis_drift_list <- list()
+  times <- seq(0, 1, length.out = n)
+  SetK <- c(64)
+for (i in seq_along(theta)){
+    ############################################################################
+    ############################################################################
+    ########## Computation of the drift spline #################################
+    ############################################################################
+    ############################################################################
+    
+    cat('\n-----Beginning Drift estimation-----\n')
+
+    cat('\n-----Class number', i, '-----\n')
+    iXtrain <- Xtrain[, which(ytrain == labels[i])]
+    classified_data_list[[i]] <- iXtrain
+    N_i <- ncol(iXtrain)
+    SupInt <- log(N_i)
+    InfInt <- -SupInt
+    # iZ <- zfun_bis(iXtrain, TimeStep)
+    iZ <- zfun(iXtrain, TimeStep)
+    cat('\n-----K value selection-----\n')
+    Kdrift[i] <- selectdimdrift_time(iXtrain[1:(n-1), ], times[1:(n-1)], iZ,
+                                     0.1, SetK, InfInt, SupInt, TimeStep, M, L)
+    b_spline_basis_drift_list[[i]] <- create_bspline_basis(rangeval = c(InfInt, SupInt),
+                                                           nbasis = Kdrift[i] + M,
+                                                           degree = M)
+    cat('\n-----Selected value K : ', Kdrift[i], '-----\n')
+    iB <- bfun_time(iXtrain[1:(n-1), ], times[1:(n-1)],
+                    b_spline_basis_drift_list[[i]], InfInt,
+                    SupInt, Kdrift[i], M)
+    Drift_a_hat[[i]] <- optimfun(iB, iZ, Kdrift[i], M, L)
+    drift_estim <- matrix(0, nrow = n-1, ncol = N_i)
+    for (j in 1:N_i){
+      drift_estim[, j] <- driftspline_time(iXtrain[1:(n-1), j],times[1:(n-1)], Drift_a_hat[[i]],
+                                      b_spline_basis_drift_list[[i]],
+                                      InfInt, SupInt, L)
+    }
+    ############################################################################
+    ############################################################################
+    ########## Computation of the drift real values ############################
+    ############################################################################
+    ############################################################################
+    calculate_b_values <- function(Xtrain, label, labels) {
+    
+    # Get the number of rows and columns in iXtrain_adapted
+    N <- ncol(Xtrain)
+    n <- nrow(Xtrain)
+  
+    # Initialize a matrix to store the results
+    results <- matrix(0, nrow = n, ncol = N)
+    
+    # Loop over each time and each column of iXtrain_adapted to calculate b_time
+    for (j in 1:N) {
+      for (i in 1:n) {
+        # Calculate b_time for each combination of time and X_t value
+        results[i, j] <- b_orstein(Xtrain[i, j], label, labels)
+      }
+    }
+  
+    return(results)
+  }
+    b_values <- calculate_b_values(iXtrain[1:(n-1), ], labels[i], labels)
+    
+    b_df <- data.frame(
+      X = as.vector(iXtrain[1:(n-1), ]),
+      Value = as.vector(b_values),
+      Type = "Drift",  # Adding a type column to distinguish between b and zfun
+      Group = rep(1:ncol(iXtrain), each = n-1)
+     )
+
+   # Create data frame for zfun values
+   bspline_drift_df <- data.frame(
+    X = as.vector(iXtrain[1:(n-1), ]),
+    Value = as.vector(drift_estim),
+    Type = "Increment",  # Adding a type column to distinguish between b and zfun
+    Group = rep(1:ncol(iXtrain), each = n-1)
+   )
+    
+   # Combine both data frames
+   combined_df <- rbind(bspline_drift_df,b_df)
+    
+  p2 <-ggplot(combined_df, aes(x = X, y = Value, color = Type, group = interaction(Type, Group))) +
+    geom_point(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+    labs(
+      title = "Drift and Increment Values for Each Trajectory in Xtrain",
+      x = "Process X",
+      y = "Value"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+    #theme(legend.position = "right") +
+    #guides(color = guide_legend(title = "Trajectory"))
+  print(p2)
+  
+  # df <- data.frame(
+  # x = as.vector(iXtrain_adapted),
+  # y = as.vector(rep(times[1:(n-1)], N_i)),
+  # z = as.vector(drift_estim)
+  # )
+  # library(rgl)
+  # # Plot using plotly's heatmap
+  # plot3d(x = as.vector(iXtrain_adapted),
+  #        y = as.vector(rep(times[1:(n-1)], N_i)),
+  #        z = as.vector(drift_estim), 
+  #        col = "blue")
+  # points3d(x = as.vector(iXtrain_adapted),
+  #        y = as.vector(rep(times[1:(n-1)], N_i)),
+  #        z = as.vector(b_values), 
+  #        col = "green")
+}
+````
+
+
+
+### Predictions 
+```{r prediction-classification, echo=TRUE}
+classification_result <- sde_classif_time(Xtrain, ytrain, Xtest, ytest, SetK,
+                                          labels, M = 3, overfit_check = TRUE)
+# classification_result <- sde_classif_authors(Xtrain, ytrain, Xtest, ytest, SetK,
+#                                           labels, M = 3, overfit_check = TRUE)
+```
+
+### Extraction of predicted labels
+```{r predicted-labels-classification, echo=TRUE}
+predicted_labels <- classification_result$PredClass
+predicted_labels_train <- classification_result$PredClass_train
+```
+
+### Misclassification Analysis
+```{r misclassification-classification, echo=TRUE}
+accuracy <- function(y_real, predictions) {
+  mean(y_real == predictions)
+}
+
+accuracy_value <- accuracy(ytest, predicted_labels)
+
+# Print the accuracy and misclassification ratio
+cat('Accuracy of the estimated classifier: ', accuracy_value * 100, '%\n')
+cat('Misclassification ratio of the estimated classifier: ', (1 - accuracy_value) * 100, '%\n')
+cat('Values N_i used for the training:', Ni_train_list)
+```
+
+### Rerun the procedure 10 times 
+```{r multiple-run-classification, echo=TRUE}
+# Initialize lists to store accuracy results
+accuracy_list_train <- c()
+accuracy_list_test <- c()
+accuracy_list_train_authors <- c()
+accuracy_list_test_authors <- c()
+
+theta_values <- list(c(-1/2, 1, 1/2),
+                    c(-3/2, 1, 3/2),
+                    c(-5/2, 1, 5/2),
+                    c(-4, 1, 4)
+                    )
+
+# theta_values = list(c(-4, 1, 4))
+single_theta_values <- list(1/2, 3/2, 5/2, 4)
+#single_theta_values <- list(1/2, 3/2, 5/2)
+#single_theta_values = list(4)
+sigma_orstein <- 1
+# Iterate over each theta value
+for (theta_ in theta_values) {
+  # Get the current theta value
+  cat('\n-----Value of theta:', theta_[length(theta_)], '-----\n')
+  
+  # Initialize vectors to store accuracy values for the current theta
+  current_accuracy_train <- numeric()
+  current_accuracy_test <- numeric()
+  current_accuracy_train_authors <- numeric()
+  current_accuracy_test_authors <- numeric()
+  
+  # Repeat the process for multiple iterations (e.g., 10 times)
+  for (i in 1:10) {  # Modify the number of iterations as needed
+    cat('\n-----Iteration:', i, '-----\n')
+    
+    cat('-----Simulations-----\n')
+    # Simulate training and testing data using the defined function
+    simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+                                        Ni_test_list, labels,
+                                        b_prime, sigma, theta_, plot = FALSE)
+    # simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+    #                                      Ni_test_list, labels,
+    #                                      b_time, sigma_time, theta_,
+    #                                      plot = FALSE)
+    # simulation_result <- simulation_sde_mix(t0, T, x0, n, Ni_train_list,
+    #                                      Ni_test_list, labels,
+    #                                      b, b_orstein, sigma_orstein, theta_, 
+    #                                      plot = FALSE)
+    
+    # Extract the simulated data
+    Xtrain <- simulation_result$Xtrain
+    ytrain <- simulation_result$ytrain
+    Xtest <- simulation_result$Xtest
+    ytest <- simulation_result$ytest
+    
+    cat('-----Predictions-----\n')
+    # Extract predicted labels for train and test data for the estimated classifier
+    predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest,
+                                                   SetK, labels, M = 3,
+                                                   plot = FALSE,
+                                                   overfit_check = TRUE,
+                                                   norm_fun = FALSE)
+    
+    predicted_labels_classifier_authors <- sde_classif_authors(Xtrain, ytrain, Xtest, ytest,
+                                                   SetK, labels, M = 3,
+                                                   plot = FALSE,
+                                                   overfit_check = TRUE,
+                                                   norm_fun = FALSE)
+    
+    # Extract predicted labels for train and test data for the estimated classifier
+    predicted_labels <- predicted_labels_classifier$PredClass
+    predicted_labels_train <- predicted_labels_classifier$PredClass_train
+    
+    predicted_labels_authors <- predicted_labels_classifier_authors$PredClass
+    predicted_labels_train_authors <- predicted_labels_classifier_authors$PredClass_train
+  
+  
+    # Calculate accuracy for test and train data and store in lists
+    accuracy_test <- 1 - accuracy(ytest, predicted_labels)
+    accuracy_train <- 1 - accuracy(ytrain, predicted_labels_train)
+    
+    accuracy_test_authors <- 1 - accuracy(ytest, predicted_labels_authors)
+    accuracy_train_authors <- 1 - accuracy(ytrain, predicted_labels_train_authors)
+    
+    # Store the accuracy values for the current iteration
+    current_accuracy_test <- c(current_accuracy_test, accuracy_test)
+    current_accuracy_train <- c(current_accuracy_train, accuracy_train)
+    
+    current_accuracy_test_authors <- c(current_accuracy_test_authors, 
+                                       accuracy_test_authors)
+    current_accuracy_train_authors <- c(current_accuracy_train_authors, 
+                                        accuracy_train_authors)
+    
+    cat('-----For theta =',theta_[3],'Misclassification:',mean(current_accuracy_test),'\n')
+    cat('-----For theta =',theta_[3],'Misclassification Authors:',mean(current_accuracy_test_authors),'\n')
+  }
+  
+  # Store the results for the current theta in the main lists
+  accuracy_list_test[[paste0("theta_", theta_[3])]] <- current_accuracy_test
+  accuracy_list_train[[paste0("theta_", theta_[3])]] <- current_accuracy_train
+  accuracy_list_test_authors[[paste0("theta_", theta_[3])]] <- current_accuracy_test_authors
+  accuracy_list_train_authors[[paste0("theta_", theta_[3])]] <- current_accuracy_train_authors
+}
+
+# Calculate mean accuracies per theta
+mean_accuracy_test <- sapply(accuracy_list_test, mean)
+sd_accuracy_test <- sapply(accuracy_list_test, sd)
+mean_accuracy_train <- sapply(accuracy_list_train, mean)
+sd_accuracy_train <- sapply(accuracy_list_train, sd)
+
+mean_accuracy_test_authors <- sapply(accuracy_list_test_authors, mean)
+sd_accuracy_test_authors <- sapply(accuracy_list_test_authors, sd)
+mean_accuracy_train_authors <- sapply(accuracy_list_train_authors, mean)
+sd_accuracy_train_authors <- sapply(accuracy_list_train_authors, sd)
+#mean_accuracy_test <- sapply(accuracy_list_test_bayes, mean)
+
+# Create a table of the results
+results <- data.frame(
+  Theta = paste0("θ = ", single_theta_values),
+  Mean_Train_Accuracy = mean_accuracy_test, 
+  Sd_Train_Accuracy = sd_accuracy_test,
+  Mean_Train_Accuracy_Authors = mean_accuracy_test_authors, 
+  Sd_Train_Accuracy_Authors = sd_accuracy_test_authors
+  #Mean_Test_Accuracy = mean_accuracy_test
+)
+
+print(results)
+
+# Display the summary table nicely
+knitr::kable(results, caption = "Mean Accuracies Per Theta")
+```
+
+## Performance of the Bayes classifier
+
+### Implementation of the Bayes classifier Homogeneous
+```{r bayes-implementation, echo=TRUE}
+# Function to compute the integral F_i^*(X)
+compute_F_star <- function(X, b, sigma, theta) {
+  # Length of the process
+  n <- length(X)
+  # Define the time grid (assuming X is sampled over [0, 1])
+  time_grid <- seq(0, 1, length.out = n)
+
+  # Initialize F_star
+  F_star <- 0
+  
+  # Compute F_star using the process values
+  for (i in 1:(n-1)) {
+    dt <- 1/n
+    b_star <- b(X[i], theta)
+    sigma_star <- sigma(X[i])
+    F_star <- F_star + (b_star / sigma_star^2) * (X[i+1] - X[i]) - 0.5 * (b_star^2 / sigma_star^2) * dt
+  }
+  
+  return(F_star)
+}
+
+# Define the Bayes classifier function for a dataset with labels
+bayes_classifier <- function(X, b, sigma, theta, p_star, labels) {
+  # Number of classes
+  K <- length(theta)
+  # Number of processes (columns of X)
+  num_processes <- ncol(X)
+  
+  # Initialize a vector to store the predicted labels
+  predicted_labels <- vector("character", length = num_processes)
+  
+  softmax <- function(x) {
+    exp_x <- exp(x - max(x))  # Subtract max(x) for numerical stability
+    return(exp_x / sum(exp_x))
+  }
+  
+  # Iterate over each process in the dataset
+  for (j in 1:num_processes) {
+    # Extract the j-th process
+    process <- X[, j]  # Assuming each column is a different process
+    
+    # Compute F_star for each class for the current process
+    F_star <- sapply(1:K, function(i) {
+      # Use the compute_F_star function to calculate F_i^*(X) for class i
+      compute_F_star(process, b, sigma, theta[i])
+    })
+    
+    # Compute the softmax probabilities pi_i^*(X) using nnet::softmax
+    pi_star <- softmax(F_star + log(p_star))
+    
+    # Predict the class by choosing the label with the highest probability
+    predicted_class_index <- which.max(pi_star)
+    predicted_labels[j] <- labels[predicted_class_index]
+  }
+  
+  return(predicted_labels)
+}
+```
+### Implementation of the Bayes classifier Non-Homogeneous
+```{r bayes-implementation, echo=TRUE}
+# Function to compute the integral F_i^*(X)
+compute_F_star_time <- function(X, b, sigma, theta) {
+  # Length of the process
+  n <- length(X)
+  # Define the time grid (assuming X is sampled over [0, 1])
+  time_grid <- seq(0, 1, length.out = n)
+
+  # Initialize F_star
+  F_star <- 0
+  
+  # Compute F_star using the process values
+  for (i in 1:(n-1)) {
+    dt <- 1/n
+    b_star <- b(X[i], theta, time_grid[i])
+    sigma_star <- sigma(X[i], time_grid[i])
+    F_star <- F_star + (b_star / sigma_star^2) * (X[i+1] - X[i]) - 0.5 * (b_star^2 / sigma_star^2) * dt
+  }
+  
+  return(F_star)
+}
+
+# Define the Bayes classifier function for a dataset with labels
+bayes_classifier_time <- function(X, b, sigma, theta, p_star, labels) {
+  # Number of classes
+  K <- length(theta)
+  # Number of processes (columns of X)
+  num_processes <- ncol(X)
+  
+  # Initialize a vector to store the predicted labels
+  predicted_labels <- vector("character", length = num_processes)
+  
+  softmax <- function(x) {
+    exp_x <- exp(x - max(x))  # Subtract max(x) for numerical stability
+    return(exp_x / sum(exp_x))
+  }
+  
+  # Iterate over each process in the dataset
+  for (j in 1:num_processes) {
+    # Extract the j-th process
+    process <- X[, j]  # Assuming each column is a different process
+    
+    # Compute F_star for each class for the current process
+    F_star <- sapply(1:K, function(i) {
+      # Use the compute_F_star function to calculate F_i^*(X) for class i
+      compute_F_star_time(process, b, sigma, theta[i])
+    })
+    
+    # Compute the softmax probabilities pi_i^*(X) using nnet::softmax
+    pi_star <- softmax(F_star + log(p_star))
+    
+    # Predict the class by choosing the label with the highest probability
+    predicted_class_index <- which.max(pi_star)
+    predicted_labels[j] <- labels[predicted_class_index]
+  }
+  
+  return(predicted_labels)
+}
+```
+### Definition of the parameters
+```{r parameters-bayes, echo=TRUE}
+t0 <- 0
+T <- 1
+x0 <- 0
+n <- 100
+Ni_train_list <- c(100, 100, 100)
+Ni_test_list <- c(100, 100, 100)
+labels <- c(1, 2, 3)
+theta <- c(-0.5, 1, 0.5)
+SetK <- 2^(0:4)
+p_star = c(1/3,1/3,1/3)
+```
+
+### Simulation of SDE for training and testing data sets
+```{r sde-bayes, echo=TRUE}
+simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+                                         Ni_test_list, labels,
+                                         b_time, sigma_time, theta)
+# simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+#                                          Ni_test_list, labels,
+#                                          b, sigma, theta)
+Xtrain <- simulation_result$Xtrain
+ytrain <- simulation_result$ytrain
+Xtest <- simulation_result$Xtest
+ytest <- simulation_result$ytest
+```
+### Predictions using the Bayes classifier
+```{r prediction-bayes, echo=TRUE}
+# predictions_bayes <- bayes_classifier(Xtest, b, sigma, theta, p_star, labels)
+predictions_bayes <- bayes_classifier_time(Xtest, b_time, sigma_time, theta, p_star, labels)
+```
+### Misclassification analysis of the Bayes classifier
+```{r misclassification-bayes, echo=TRUE}
+accuracy_value <- accuracy(ytest, predictions_bayes)
+
+# Print the accuracy and misclassification ratio
+cat('Accuracy of the Bayes classifier: ', accuracy_value * 100, '%\n')
+cat('Misclassification ratio of the Bayes classifier: ', (1 - accuracy_value) * 100, '%\n')
+```
+
+
+### Rerun the procedure 10 times 
+```{r multiple-run-classification, echo=TRUE}
+t0 <- 0
+T <- 1
+x0 <- 0
+n <- 100
+Ni_train_list <- c(100, 100, 100)
+Ni_test_list <- c(100, 100, 100)
+labels <- c(1, 2, 3)
+theta <- c(-4, 1, 4)
+SetK <- 2^(0:4)
+p_star = c(1/3,1/3,1/3)
+# Initialize lists to store accuracy results
+#accuracy_list_train_bayes <- c()
+misclassification_list_test_bayes <- c()
+misclassification_list_test <- c()
+misclassification_list_train <- c()
+
+theta_values = list(c(-1/2,1,1/2), 
+                    c(-3/2,1,3/2),
+                    c(-5/2,1,5/2),
+                    c(-4,1,4))
+
+single_theta_values = list(1/2, 3/2, 5/2, 4)
+# Iterate over each theta value
+for (theta_ in theta_values) {
+  # Get the current theta value
+  cat('\n-----Value of theta:', theta_[3], '-----\n')
+  
+  # Initialize vectors to store accuracy values for the current theta
+  current_misclassification_test <- numeric()
+  current_misclassification_train <- numeric()
+  
+  # Repeat the process for multiple iterations (e.g., 10 times)
+  for (i in 1:10) {  # Modify the number of iterations as needed
+    cat('\n-----Iteration:', i, '-----\n')
+    
+    cat('-----Simulations-----\n')
+    # Simulate training and testing data using the defined function
+    simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+                                        Ni_test_list, labels,
+                                        b_time, sigma_time, theta_, plot = FALSE)
+    
+    # Extract the simulated data
+    Xtrain <- simulation_result$Xtrain
+    ytrain <- simulation_result$ytrain
+    Xtest <- simulation_result$Xtest
+    ytest <- simulation_result$ytest
+    
+    cat('-----Predictions-----\n')
+    # Extract predicted labels for train and test data for the estimated classifier
+    #predicted_labels_bayes <- bayes_classifier(Xtest, b, sigma, theta, p_star, labels)
+    predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest,
+                                                   SetK, labels, M = 3,
+                                                   plot = FALSE,
+                                                   overfit_check = TRUE,
+                                                   norm_fun = FALSE)
+    
+    # Extract predicted labels for train and test data for the estimated classifier
+    predicted_labels <- predicted_labels_classifier$PredClass
+    predicted_labels_train <- predicted_labels_classifier$PredClass_train
+    
+    predicted_labels_test_bayes <- bayes_classifier_time(Xtest, b_time, 
+                                                         sigma_time, theta_, 
+                                                         p_star, labels)
+
+  
+    # Calculate accuracy for test and train data and store in lists
+    misclassification_test <- 1 - accuracy(ytest, predicted_labels)
+    misclassification_train <- 1 - accuracy(ytrain, predicted_labels_train)
+    
+    # Store the accuracy values for the current iteration
+    current_misclassification_test <- c(current_misclassification_test, 
+                                        misclassification_test)
+    current_misclassification_train <- c(current_misclassification_train, 
+                                         misclassification_train)
+    
+    current_misclassification_test_bayes <- 1 - accuracy(ytest, predicted_labels_test_bayes)
+    
+    cat('-----For theta =',theta_[3],'Misclassification of our classifier on test set:',
+        current_misclassification_test[length(current_misclassification_test)],'\n')
+    cat('-----For theta =',theta_[3],'Misclassification of Bayes classifier on test set:',
+        current_misclassification_test_bayes[length(current_misclassification_test_bayes)],'\n')
+
+  }
+  
+  # Store the results for the current theta in the main lists
+  misclassification_list_test[[paste0("theta_", theta_[3])]] <- current_misclassification_test
+  misclassification_list_train[[paste0("theta_", theta_[3])]] <- current_misclassification_train
+  
+  misclassification_list_test_bayes[[paste0("theta_", theta_[3])]] <- current_misclassification_test_bayes
+}
+
+# Calculate mean accuracies per theta
+mean_misclassification_test <- sapply(misclassification_list_test, mean)
+sd_misclassification_test <- sapply(misclassification_list_test, sd)
+
+mean_misclassification_test_bayes <- sapply(misclassification_list_test_bayes, mean)
+sd_misclassification_test_bayes <- sapply(misclassification_list_test_bayes, sd)
+
+# Create a table of the results
+results <- data.frame(
+  Theta = paste0("θ = ", single_theta_values),
+  Empirical_Excess_Risk = mean_misclassification_test - mean_misclassification_test_bayes, 
+  Sd_Test_Misclassification = min(sd_misclassification_test,sd_misclassification_test_bayes)
+)
+
+print(results)
+
+# Display the summary table nicely
+knitr::kable(results, caption = "Mean Miclassifications Per Theta")
+```
+
+
+
+## Expected Risk Plug-in - Bayes
+### Expected Risk w.r.t N
+```{r excess-risk-n-loop, echo=TRUE}
+#N_list <- seq(50, 300, by = 50)
+N_list <- c(100,200,300)
+t0 <- 0
+T <- 1
+x0 <- 0
+n <- 100
+Ni_test_list <- c(100, 100, 100)
+labels <- c(1, 2, 3)
+theta <- c(-4, 1, 4)
+SetK <- 2^(0:4)
+p_star = c(1/3,1/3,1/3)
+#N_list <- c(300)
+# Initialize lists to store accuracy results for training and testing
+accuracy_list_train <- c()
+accuracy_list_test <- c()
+accuracy_list_train_bayes <- c()
+accuracy_list_test_bayes <- c()
+n_list = N_list
+# Loop over the values in N_list
+#for (N in N_list) {
+for (i in seq_along(N_list)) {
+  N = N_list[i]
+  n = n_list[i]
+  cat('\n-----N =', N, 'n =', n, '-----\n')
+  
+  # Set Ni_train_list with the current value of N
+  Ni_train_list <- rep(N, 3)
+  
+  # Simulate training and testing data using the defined function
+  # simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b, sigma, theta, plot = FALSE)
+  current_accuracy_train <- numeric()
+  current_accuracy_test <- numeric()
+  current_accuracy_train_bayes <- numeric()
+  current_accuracy_test_bayes <- numeric()
+  
+  # Repeat the process for multiple iterations (e.g., 10 times)
+  for (i in 1:10) {  # Modify the number of iterations as needed
+    cat('\n-----Iteration:', i, '-----\n')
+    
+    cat('-----Simulations-----\n')
+    # Simulate training and testing data using the defined function
+    # simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+    #                                     Ni_test_list, labels,
+    #                                     b, sigma, theta_, plot = FALSE)
+    simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+                                         Ni_test_list, labels,
+                                         b_time, sigma_time, theta, 
+                                         plot = FALSE)
+    
+    # Extract the simulated data
+    Xtrain <- simulation_result$Xtrain
+    ytrain <- simulation_result$ytrain
+    Xtest <- simulation_result$Xtest
+    ytest <- simulation_result$ytest
+    
+    cat('-----Predictions-----\n')
+    # Extract predicted labels for train and test data for the estimated classifier
+    predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest,
+                                                   SetK, labels, M = 3,
+                                                   plot = FALSE,
+                                                   overfit_check = TRUE,
+                                                   norm_fun = FALSE)
+    
+    # Extract predicted labels for train and test data for the estimated classifier
+    predicted_labels <- predicted_labels_classifier$PredClass
+    predicted_labels_train <- predicted_labels_classifier$PredClass_train
+    
+    cat('-----Predictions Bayes-----\n')
+    predicted_labels_bayes <- bayes_classifier_time(Xtest, b_time, sigma_time, theta, p_star, labels)
+    predicted_labels_train_bayes <- bayes_classifier_time(Xtrain, b_time, sigma_time, theta, p_star, labels)
+    
+    # Calculate accuracy for test and train data and store in lists
+    accuracy_test <- 1 - accuracy(ytest, predicted_labels)
+    accuracy_train <- 1 - accuracy(ytrain, predicted_labels_train)
+    
+    accuracy_test_bayes <- 1 - accuracy(ytest, predicted_labels_bayes)
+    accuracy_train_bayes <- 1 - accuracy(ytrain, predicted_labels_train_bayes)
+    
+    # Store the accuracy values for the current iteration
+    current_accuracy_test <- c(current_accuracy_test, accuracy_test)
+    current_accuracy_train <- c(current_accuracy_train, accuracy_train)
+    
+    current_accuracy_test_bayes <- c(current_accuracy_test_bayes, 
+                                       accuracy_test_bayes)
+    current_accuracy_train_bayes <- c(current_accuracy_train_bayes, 
+                                        accuracy_train_bayes)
+    
+    cat('For Ni =', N, 'Misclassification:', 
+        current_accuracy_test[length(current_accuracy_test)],'\n')
+    cat('For Ni =', N, 'Misclassification Bayes:', 
+        current_accuracy_test_bayes[length(current_accuracy_test_bayes)],'\n')
+  }
+  
+  # Store the results for the current theta in the main lists
+  accuracy_list_test[[paste0("Ni_", N)]] <- current_accuracy_test
+  accuracy_list_train[[paste0("Ni_", N)]] <- current_accuracy_train
+  accuracy_list_train_bayes[[paste0("Ni_", N)]] <- current_accuracy_test_bayes
+  accuracy_list_test_bayes[[paste0("Ni_", N)]] <- current_accuracy_train_bayes
+}
+
+# Calculate mean accuracies per theta
+mean_accuracy_test <- sapply(accuracy_list_test, mean)
+sd_accuracy_test <- sapply(accuracy_list_test, sd)
+mean_accuracy_train <- sapply(accuracy_list_train, mean)
+sd_accuracy_train <- sapply(accuracy_list_train, sd)
+
+mean_accuracy_test_bayes <- sapply(accuracy_list_test_bayes, mean)
+sd_accuracy_test_bayes <- sapply(accuracy_list_test_bayes, sd)
+mean_accuracy_train_bayes <- sapply(accuracy_list_train_bayes, mean)
+sd_accuracy_train_bayes <- sapply(accuracy_list_train_bayes, sd)
+#mean_accuracy_test <- sapply(accuracy_list_test_bayes, mean)
+
+# Create a table of the results
+results <- data.frame(
+  "N" = paste0("Ni = ", N_list, " n =", n_list),
+  "Empirical_risk_on_Test_Set" = mean_accuracy_test - mean_accuracy_test_bayes, 
+  "Sd_on_Test_Set" = max(abs(sd_accuracy_test - sd_accuracy_test_bayes)),
+  "Empirical_risk_on_Train_Set" = mean_accuracy_train - mean_accuracy_train_bayes, 
+  "Sd_on_Train_Set" = max(abs(sd_accuracy_train - sd_accuracy_train_bayes))
+)
+
+print(results)
+
+# Display the summary table nicely
+knitr::kable(results, caption = "Mean Accuracies Per Theta")
+  
+```
+### Plots
+```{r}
+results_long <- melt(results, id.vars = "N", measure.vars = c("Empirical_risk_on_Test_Set", "Empirical_risk_on_Train_Set"))
+
+N_values <- N_list  # Use the numeric N values for the calculation
+N_inverse_5 <- N_values^(-1/5)  # Calculate N^{-1/5}
+
+# Add to results_long for plotting
+N_inverse_5_df <- data.frame(N = unique(results$N), value = N_inverse_5, variable = "N^{-1/5}")
+
+# Combine the datasets for plotting
+results_long <- rbind(results_long, N_inverse_5_df)
+
+ggplot(results_long, aes(x = N, y = value, color = variable, group = variable)) +
+  geom_line(size = 1) +                        
+  geom_point(size = 2) +                         
+  labs(
+    title = "Empirical Risks on Train and Test Sets",
+    x = "N",
+    y = "Empirical Risk",
+    color = "Dataset"
+  ) +
+  theme_minimal() +                             
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Expected Risk w.r.t N (Without repeting the process 10 times)
+```{r excess-risk-n-loop, echo=TRUE}
+#N_list <- seq(50, 300, by = 50)
+N_list <- c(100, 200, 500, 1000, 4000)
+t0 <- 0
+T <- 1
+x0 <- 0
+n_list <- c(100, 200, 200, 400, 500)
+Ni_test_list <- c(100, 100, 100)
+labels <- c(1, 2, 3)
+theta <- c(-4, 1, 4)
+SetK <- 2^(0:4)
+p_star = c(1/3,1/3,1/3)
+
+# Loop over the values in N_list
+#for (N in N_list) {
+for (i in seq_along(N_list)) {
+  N = N_list[i]
+  n = n_list[i]
+  cat('\n-----N =', N, 'n =', n, '-----\n')
+  
+  # Set Ni_train_list with the current value of N
+  Ni_train_list <- rep(N, 3)
+  
+  # Simulate training and testing data using the defined function
+  # simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b, sigma, theta, plot = FALSE)
+  
+  cat('-----Simulations-----\n')
+  # Simulate training and testing data using the defined function
+  # simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b, sigma, theta_, plot = FALSE)
+  simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+                                       Ni_test_list, labels,
+                                       b_time, sigma_time, theta, 
+                                       plot = FALSE)
+  
+  # Extract the simulated data
+  Xtrain <- simulation_result$Xtrain
+  ytrain <- simulation_result$ytrain
+  Xtest <- simulation_result$Xtest
+  ytest <- simulation_result$ytest
+  
+  cat('-----Predictions-----\n')
+  # Extract predicted labels for train and test data for the estimated classifier
+  predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest,
+                                                 SetK, labels, M = 3,
+                                                 plot = FALSE,
+                                                 overfit_check = TRUE,
+                                                 norm_fun = FALSE)
+  
+  # Extract predicted labels for train and test data for the estimated classifier
+  predicted_labels <- predicted_labels_classifier$PredClass
+  predicted_labels_train <- predicted_labels_classifier$PredClass_train
+  
+  cat('-----Predictions Bayes-----\n')
+  predicted_labels_bayes <- bayes_classifier_time(Xtest, b_time, sigma_time, theta, p_star, labels)
+  predicted_labels_train_bayes <- bayes_classifier_time(Xtrain, b_time, sigma_time, theta, p_star, labels)
+  
+  # Calculate accuracy for test and train data and store in lists
+  accuracy_test <- 1 - accuracy(ytest, predicted_labels)
+  accuracy_train <- 1 - accuracy(ytrain, predicted_labels_train)
+  
+  accuracy_test_bayes <- 1 - accuracy(ytest, predicted_labels_bayes)
+  accuracy_train_bayes <- 1 - accuracy(ytrain, predicted_labels_train_bayes)
+  
+  # Store the accuracy values for the current iteration
+  current_accuracy_test <- c(current_accuracy_test, accuracy_test)
+  current_accuracy_train <- c(current_accuracy_train, accuracy_train)
+  
+  current_accuracy_test_bayes <- c(current_accuracy_test_bayes, 
+                                     accuracy_test_bayes)
+  current_accuracy_train_bayes <- c(current_accuracy_train_bayes, 
+                                      accuracy_train_bayes)
+  
+  cat('For Ni =', N, 'Misclassification:', 
+      current_accuracy_test[length(current_accuracy_test)],'\n')
+  cat('For Ni =', N, 'Misclassification Bayes:', 
+      current_accuracy_test_bayes[length(current_accuracy_test_bayes)],'\n')
+  
+  # Store the results for the current theta in the main lists
+  accuracy_list_test[[paste0("Ni_", N)]] <- current_accuracy_test
+  accuracy_list_train[[paste0("Ni_", N)]] <- current_accuracy_train
+  accuracy_list_train_bayes[[paste0("Ni_", N)]] <- current_accuracy_test_bayes
+  accuracy_list_test_bayes[[paste0("Ni_", N)]] <- current_accuracy_train_bayes
+}
+
+# Calculate mean accuracies per theta
+mean_accuracy_test <- sapply(accuracy_list_test, mean)
+sd_accuracy_test <- sapply(accuracy_list_test, sd)
+mean_accuracy_train <- sapply(accuracy_list_train, mean)
+sd_accuracy_train <- sapply(accuracy_list_train, sd)
+
+mean_accuracy_test_bayes <- sapply(accuracy_list_test_bayes, mean)
+sd_accuracy_test_bayes <- sapply(accuracy_list_test_bayes, sd)
+mean_accuracy_train_bayes <- sapply(accuracy_list_train_bayes, mean)
+sd_accuracy_train_bayes <- sapply(accuracy_list_train_bayes, sd)
+#mean_accuracy_test <- sapply(accuracy_list_test_bayes, mean)
+N_list <- c(100, 200, 300, 500, 1000, 4000)
+n_list <- c(100, 200, 200, 200, 400, 500)
+# Create a table of the results
+results <- data.frame(
+  "N" = paste0("Ni = ", N_list, " n =", n_list),
+  "Empirical_risk_on_Test_Set" = mean_accuracy_test - mean_accuracy_test_bayes, 
+  "Sd_on_Test_Set" = max(abs(sd_accuracy_test - sd_accuracy_test_bayes)),
+  "Empirical_risk_on_Train_Set" = mean_accuracy_train - mean_accuracy_train_bayes, 
+  "Sd_on_Train_Set" = max(abs(sd_accuracy_train - sd_accuracy_train_bayes))
+)
+
+print(results)
+
+# Display the summary table nicely
+knitr::kable(results, caption = "Mean Accuracies Per Theta")
+  
+```
+### Plots
+```{r}
+results_long <- melt(results, id.vars = "N", measure.vars = c("Empirical_risk_on_Test_Set", "Empirical_risk_on_Train_Set"))
+
+N_values <- N_list  # Use the numeric N values for the calculation
+N_inverse_5 <- N_values^(-1/5)  # Calculate N^{-1/5}
+
+# Add to results_long for plotting
+N_inverse_5_df <- data.frame(N = unique(results$N), value = N_inverse_5, variable = "N^{-1/5}")
+
+# Combine the datasets for plotting
+results_long <- rbind(results_long, N_inverse_5_df)
+
+ggplot(results_long, aes(x = N, y = value, color = variable, group = variable)) +
+  geom_line(size = 1) +                        
+  geom_point(size = 2) +                         
+  labs(
+    title = "Empirical Risks on Train and Test Sets",
+    x = "N",
+    y = "Empirical Risk",
+    color = "Dataset"
+  ) +
+  theme_minimal() +                             
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Plots
+```{r plot-excess-risk-n, echo=TRUE}
+# Calculate the theoretical line
+theoretical_line <- N_list^(-1/5)
+
+# Determine the range for ylim that includes small values
+custom_ylim <- range(c(accuracy_list_test - accuracy_list_test_bayes, 
+                       accuracy_list_train - accuracy_list_train_bayes,
+                       theoretical_line))
+
+# Add a small margin to the range if values are too small
+custom_ylim <- c(min(custom_ylim) - 0.01, max(custom_ylim) + 0.01)
+
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+# Plot the misclassification ratio for test data
+plot(N_list, accuracy_list_test - accuracy_list_test_bayes, type = 'o', col = 'blue', pch = 16,
+     xlab = 'N', ylab = 'Misclassification Ratio',
+     main = 'Misclassification Ratio wrt N', ylim = custom_ylim)
+
+# Add the misclassification ratio for train data
+lines(N_list, accuracy_list_train - accuracy_list_train_bayes, type = 'o', col = 'red', pch = 16)
+
+#lines(N_list, accuracy_list_test_authors - accuracy_list_train_bayes, type = 'o', col = 'black', pch = 16)
+
+# Add the theoretical line C.N^(-1/5)
+lines(N_list, theoretical_line, type = 'o', col = 'green', pch = 16)
+
+# Add a legend
+legend('topright', legend = c('Expected Risk "Classifier - Bayes" on test set', 
+                              'Expected Risk "Classifier - Bayes" on train set', 
+                              'C.N^(-1/5)'),
+       col = c('blue', 'red', 'green'), pch = 16, lty = 1, cex = 0.5, bty = "n")
+
+# Add text labels for the y-coordinate values of test data
+text(N_list, accuracy_list_test - accuracy_list_test_bayes, 
+     labels = round(accuracy_list_test - accuracy_list_test_bayes, 4), 
+     pos = 3, col = 'blue', cex = 0.5)
+
+# Add text labels for the y-coordinate values of train data
+text(N_list, accuracy_list_train - accuracy_list_train_bayes, 
+     labels = round(accuracy_list_train - accuracy_list_train_bayes, 4), 
+     pos = 3, col = 'red', cex = 0.5)
+
+# Add text labels for the theoretical line values
+text(N_list, theoretical_line, 
+     labels = round(theoretical_line, 4), 
+     pos = 3, col = 'green', cex = 0.5)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Norm Estimated coefficient - Real coefficient
+### Computation of norms between estimated coefficients and real coefficients
+```{r norm-loop-n, echo=TRUE}
+#N_list <- seq(50, 500, by = 50)
+N_list <- c(1000, 5000, 10000)
+n = 100
+drift_norm_list_time <- array(0, dim = c(length(N_list), length(labels)))
+diff_norm_list_time <- c()
+
+# Loop over the values in N_list
+#for (N in N_list) {
+for (i in seq_along(N_list)) {
+  N = N_list[i]
+  cat('\n-----Value of N:', N, '-----\n')
+  
+  # Set Ni_train_list with the current value of N
+  Ni_train_list <- rep(N, 3)
+  
+  # Simulate training and testing data using the defined function
+  simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+                                      Ni_test_list, labels,
+                                      b, sigma, theta, plot = FALSE)
+  # simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b_time, sigma_time, theta, plot = FALSE)
+  
+  # Extract the simulated data
+  Xtrain <- simulation_result$Xtrain
+  ytrain <- simulation_result$ytrain
+  Xtest <- simulation_result$Xtest
+  ytest <- simulation_result$ytest
+  
+  # Perform classification and get predictions
+  predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest, 
+                                                  SetK, labels, M = 3, plot = FALSE, 
+                                                  overfit_check = TRUE, 
+                                                  norm_fun = TRUE)
+
+  drift_norm_list_time[i,] <- colMeans(predicted_labels_classifier$NormsDrift)
+  diff_norm_list_time <- c(diff_norm_list_time, 
+                      mean(unlist(predicted_labels_classifier$NormsDiff)))
+}
+```
+### Plots
+```{r plot-norm-loop-n, echo=TRUE}
+# Convert the drift_norm_list matrix to a long format for ggplot2
+drift_df_time <- melt(drift_norm_list_time)
+colnames(drift_df_time) <- c("Observation", "Class", "DriftNorm")
+
+# Create a data frame for diff_norm_list
+diff_df_time <- data.frame(Observation = 1:length(diff_norm_list_time), DiffNorm = diff_norm_list_time)
+
+# Plot Drift Norms for each class
+p1 <- ggplot(drift_df_time, aes(x = Observation, y = DriftNorm, color = factor(Class))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Drift Norms by Class", x = "Observation", y = "Drift Norms") +
+  theme_minimal() +
+  theme(legend.position = "right",
+            panel.background = element_rect(fill = "gray90", color = NA),  # Change panel background to gray
+            plot.background = element_rect(fill = "gray95", color = NA))
+  scale_color_discrete(name = "Class")
+
+# Plot Diff Norms
+p2 <- ggplot(diff_df_time, aes(x = Observation, y = DiffNorm)) +
+  geom_line(color = "blue") +
+  geom_point(color = "blue") +
+  labs(title = "Diffusion Norms", x = "Observation", y = "Diffusion Norms") +
+  theme_minimal() +
+  theme(legend.position = "right",
+            panel.background = element_rect(fill = "gray90", color = NA),  # Change panel background to gray
+            plot.background = element_rect(fill = "gray95", color = NA))
+
+# Print the plots
+print(p1)
+print(p2)
+```
+
+## Experiments
+### Trials with higher values of K
+```{r importation-functions, echo=TRUE}
+rm(list = ls())
+source(file = "./SDEsimulation.R")
+source(file = "./UsefulFunctions_Homogeneous.R")
+source(file = "./UsefulFunctions_non_Homogeneous.R")
+source(file = "./MainSDEFunction_non_Homogeneous.R")
+#source(file = "./SDEclassif.R")
+```
+#### Definition of the parameters
+```{r param-definition, echo=TRUE}
+t0 <- 0
+T <- 1
+x0 <- 0
+n <- 100
+Ni_train_list <- c(100, 100, 100)
+Ni_test_list <- c(10, 10, 10)
+labels <- c(1, 2, 3)
+theta <- c(3/4, 1, 5/4)
+setK <- 2^(0:4)
+```
+
+#### Simulation of SDE for training and testing data sets
+```{r sde-simul, echo=TRUE}
+# simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+#                                          Ni_test_list, labels,
+#                                          b_time, sigma_time, theta)
+simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+                                         Ni_test_list, labels,
+                                         b_prime, sigma_simple, theta)
+Xtrain <- simulation_result$Xtrain
+ytrain <- simulation_result$ytrain
+Xtest <- simulation_result$Xtest
+ytest <- simulation_result$ytest
+```
+```{r}
+# Create a sequence of x values from 0 to 1
+x_values <- seq(-4, 4, length.out = 100)
+
+# Set theta and t for plotting
+theta <- -4  
+
+# Compute values for drift and diffusion functions
+b_values <- sapply(x_values, b, theta = theta)
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  x = x_values,
+  Drift = b_values
+)
+
+# Plot the Drift function
+p1 <- ggplot(plot_data, aes(x = x)) +
+  geom_line(aes(y = Drift), color = 'blue') +
+  labs(title = expression(paste("Drift Function ", b(x, theta, t))),
+       x = "x", y = "Drift Value") +
+  theme_minimal()
+
+# Print both plots
+print(p1)
+#print(p2)
+
+
+````
+```{r}
+Xtrain_class1 <- Xtrain[1:(n-1), which(ytrain == 1)]
+
+# Compute increments using zfun for the selected class
+Z <- zfun(Xtrain[, which(ytrain == 1)], 1/n)
+
+# Convert increments and corresponding process values to a data frame
+Z_df <- as.data.frame(Z)
+Xtrain_class1_df <- as.data.frame(Xtrain_class1)
+
+# Combine the data into a long format for plotting, using Xtrain values as x-axis
+Z_long <- reshape2::melt(Z_df, variable.name = "Coord", value.name = "Increment")
+X_long <- reshape2::melt(Xtrain_class1_df, variable.name = "Coord", value.name = "Process")
+
+# Ensure the same ordering in both long data frames to align them correctly
+Z_long$Process <- X_long$Process
+
+# Plot increments with X values as the x-axis
+ggplot(Z_long, aes(x = Process, y = Increment, color = Coord, group = Coord)) +
+  geom_line() +
+  labs(title = "Incréments des Trajectoires pour la Classe 1",
+       x = "Process X",
+       y = "Incrément") +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  guides(color = guide_legend(title = "Coordonnées"))
+
+````
+
+#### Predictions 
+```{r prediction-classification, echo=TRUE}
+classification_result <- sde_classif_time(Xtrain, ytrain, Xtest, ytest, setK, 
+                                          labels, M = 3, overfit_check = TRUE)
+```
+
+#### Extraction of predicted labels
+```{r predicted-labels-classification, echo=TRUE}
+predicted_labels <- classification_result$PredClass
+predicted_labels_train <- classification_result$PredClass_train
+```
+
+#### Misclassification Analysis
+```{r misclassification-classification, echo=TRUE}
+accuracy <- function(y_real, predictions) {
+  mean(y_real == predictions)
+}
+
+accuracy_value <- accuracy(ytest, predicted_labels)
+
+# Print the accuracy and misclassification ratio
+cat('Accuracy of the estimated classifier: ', accuracy_value * 100, '%\n')
+cat('Misclassification ratio of the estimated classifier: ', (1 - accuracy_value) * 100, '%\n')
+cat('Values N_i used for the training:', Ni_train_list)
+```
+
+#### Expected Risk
+```{r excess-risk-n-loop, echo=TRUE}
+N_list <- seq(100, 1000, by = 100)
+Ni_test_list <- c(100, 100, 100)
+K = 2^4
+setK <- 2^(0:4)
+p_star = c(1/3,1/3,1/3)
+labels <- c(1, 2, 3)
+#theta <- c(-4, 1, 4)
+theta <- c(3/4, 1, 5/4)
+
+# Initialize lists to store accuracy results for training and testing
+accuracy_list_train <- c()
+accuracy_list_test <- c()
+accuracy_list_train_bayes <- c()
+accuracy_list_test_bayes <- c()
+
+# Loop over the values in N_list
+#for (N in N_list) {
+for (i in seq_along(N_list)) {
+  N = N_list[i]
+  cat('\n-----Value of N:', N, '-----\n')
+  
+  # Set Ni_train_list with the current value of N
+  Ni_train_list <- rep(N, 3)
+  
+  # Simulate training and testing data using the defined function
+  # simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b, sigma, theta, plot = FALSE)
+  simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+                                      Ni_test_list, labels,
+                                      b, sigma_simple, theta, plot = FALSE)
+  
+  # Extract the simulated data
+  Xtrain <- simulation_result$Xtrain
+  ytrain <- simulation_result$ytrain
+  Xtest <- simulation_result$Xtest
+  ytest <- simulation_result$ytest
+  
+  # Perform classification and get predictions
+    predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest,
+                                                  setK, labels, M = 3,
+                                                  plot = FALSE,
+                                                  overfit_check = TRUE)
+  # predicted_labels_classifier <- sde_classif_time_K(Xtrain, ytrain, Xtest, ytest,
+  #                                                 K, labels, M = 3,
+  #                                                 plot = FALSE,
+  #                                                 overfit_check = TRUE)
+  
+  # Extract predicted labels for train and test data for the estimated classifier
+  predicted_labels <- predicted_labels_classifier$PredClass
+  predicted_labels_train <- predicted_labels_classifier$PredClass_train
+
+  # Extract predicted labels for train and test data for the Bayes classifier
+  predicted_labels_bayes <- bayes_classifier(Xtest, b, sigma, theta, p_star, labels)
+  predicted_labels_train_bayes <- bayes_classifier(Xtrain, b, sigma, theta, p_star, labels)
+
+  # Calculate accuracy for test and train data and store in lists
+  accuracy_test <- 1 - accuracy(ytest, predicted_labels)
+  accuracy_train <- 1 - accuracy(ytrain, predicted_labels_train)
+  accuracy_test_bayes <- 1 - accuracy(ytest, predicted_labels_bayes)
+  accuracy_train_bayes <- 1 - accuracy(ytrain, predicted_labels_train_bayes)
+  cat('Misclassification on test set for N = ', N, ':', accuracy_test,'\n')
+  
+  accuracy_list_test <- c(accuracy_list_test, accuracy_test)
+  accuracy_list_train <- c(accuracy_list_train, accuracy_train)
+  accuracy_list_test_bayes <- c(accuracy_list_test_bayes, accuracy_test_bayes)
+  accuracy_list_train_bayes <- c(accuracy_list_train_bayes, accuracy_train_bayes)
+}
+```
+
+#### Plots
+```{r plot-excess-risk-n, echo=TRUE}
+# Calculate the theoretical line
+theoretical_line <- N_list^(-1/5)
+
+diff_test <- accuracy_list_test - accuracy_list_test_bayes
+diff_train <- accuracy_list_train - accuracy_list_train_bayes
+# Determine the range for ylim that includes small values
+custom_ylim <- range(c(diff_test, 
+                       diff_train,
+                       theoretical_line))
+
+# Add a small margin to the range if values are too small
+custom_ylim <- c(min(custom_ylim) - 0.01, max(custom_ylim) + 0.01)
+print(custom_ylim)
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+# Plot the misclassification ratio for test data
+plot(N_list, accuracy_list_test - accuracy_list_test_bayes, type = 'o', col = 'blue', pch = 16,
+     xlab = 'N', ylab = 'Misclassification Ratio',
+     main = 'Misclassification Ratio wrt N', ylim = custom_ylim)
+
+# Add the misclassification ratio for train data
+lines(N_list, accuracy_list_train - accuracy_list_train_bayes, type = 'o', col = 'red', pch = 16)
+
+#lines(N_list, accuracy_list_test_authors - accuracy_list_train_bayes, type = 'o', col = 'black', pch = 16)
+
+# Add the theoretical line C.N^(-1/5)
+lines(N_list, theoretical_line, type = 'o', col = 'green', pch = 16)
+
+# Add a legend
+legend('topright', legend = c('Expected Risk "Classifier - Bayes" on test set', 
+                              'Expected Risk "Classifier - Bayes" on train set', 
+                              'C.N^(-1/5)'),
+       col = c('blue', 'red', 'green'), pch = 16, lty = 1, cex = 0.5, bty = "n")
+
+# Add text labels for the y-coordinate values of test data
+text(N_list, accuracy_list_test - accuracy_list_test_bayes, 
+     labels = round(accuracy_list_test - accuracy_list_test_bayes, 4), 
+     pos = 3, col = 'blue', cex = 0.5)
+
+# Add text labels for the y-coordinate values of train data
+text(N_list, accuracy_list_train - accuracy_list_train_bayes, 
+     labels = round(accuracy_list_train - accuracy_list_train_bayes, 4), 
+     pos = 3, col = 'red', cex = 0.5)
+
+# Add text labels for the theoretical line values
+text(N_list, theoretical_line, 
+     labels = round(theoretical_line, 4), 
+     pos = 3, col = 'green', cex = 0.5)
+
+```
+
+#### Norm Estimated coefficient - Real coefficient
+##### Computation of norms between estimated coefficients and real coefficients
+```{r norm-loop-n, echo=TRUE}
+#N_list <- seq(1000, 10000, by = 1000)
+N_list <- c(1000, 5000, 10000)
+n = 100
+drift_norm_list_time <- array(0, dim = c(length(N_list), length(labels)))
+diff_norm_list_time <- c()
+K <- 2^4
+
+# Loop over the values in N_list
+#for (N in N_list) {
+for (i in seq_along(N_list)) {
+  N = N_list[i]
+  cat('\n-----Value of N:', N, '-----\n')
+  
+  # Set Ni_train_list with the current value of N
+  Ni_train_list <- rep(N, 3)
+  
+  # Simulate training and testing data using the defined function
+  simulation_result <- simulation_sde(t0, T, x0, n, Ni_train_list,
+                                      Ni_test_list, labels,
+                                      b, sigma, theta, plot = FALSE)
+  # simulation_result <- simulation_sde_time(t0, T, x0, n, Ni_train_list,
+  #                                     Ni_test_list, labels,
+  #                                     b_time, sigma_time, theta, plot = FALSE)
+  
+  # Extract the simulated data
+  Xtrain <- simulation_result$Xtrain
+  ytrain <- simulation_result$ytrain
+  Xtest <- simulation_result$Xtest
+  ytest <- simulation_result$ytest
+  
+  # Perform classification and get predictions
+  # predicted_labels_classifier <- sde_classif_time(Xtrain, ytrain, Xtest, ytest, 
+  #                                                 SetK, labels, M = 3, plot = FALSE, 
+  #                                                 overfit_check = TRUE, 
+  #                                                 norm_fun = TRUE)
+  predicted_labels_classifier <- sde_classif_time_K(Xtrain, ytrain, Xtest, ytest, 
+                                                  K, labels, M = 3, plot = FALSE, 
+                                                  overfit_check = TRUE, 
+                                                  norm_fun = TRUE)
+
+  drift_norm_list_time[i,] <- colMeans(predicted_labels_classifier$NormsDrift)
+  diff_norm_list_time <- c(diff_norm_list_time, 
+                      mean(unlist(predicted_labels_classifier$NormsDiff)))
+}
+```
+##### Plots
+```{r plot-norm-loop-n, echo=TRUE}
+# Convert the drift_norm_list matrix to a long format for ggplot2
+drift_df_time <- melt(drift_norm_list_time)
+colnames(drift_df_time) <- c("Observation", "Class", "DriftNorm")
+
+# Create a data frame for diff_norm_list
+diff_df_time <- data.frame(Observation = 1:length(diff_norm_list_time), DiffNorm = diff_norm_list_time)
+
+# Plot Drift Norms for each class
+p1 <- ggplot(drift_df_time, aes(x = Observation, y = DriftNorm, color = factor(Class))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Drift Norms by Class", x = "Observation", y = "Drift Norms") +
+  theme_minimal() +
+  theme(legend.position = "right",
+            panel.background = element_rect(fill = "gray90", color = NA),  # Change panel background to gray
+            plot.background = element_rect(fill = "gray95", color = NA))
+  scale_color_discrete(name = "Class")
+
+# Plot Diff Norms
+p2 <- ggplot(diff_df_time, aes(x = Observation, y = DiffNorm)) +
+  geom_line(color = "blue") +
+  geom_point(color = "blue") +
+  labs(title = "Diffusion Norms", x = "Observation", y = "Diffusion Norms") +
+  theme_minimal() +
+  theme(legend.position = "right",
+            panel.background = element_rect(fill = "gray90", color = NA),  # Change panel background to gray
+            plot.background = element_rect(fill = "gray95", color = NA))
+
+# Print the plots
+print(p1)
+print(p2)
+```
+
+
